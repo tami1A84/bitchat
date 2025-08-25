@@ -155,6 +155,7 @@ impl NetworkManager {
 
                                 if noise.is_transport_mode() {
                                     info!("Handshake with {} complete!", peer.name);
+                                    net_event_tx.send(NetworkEvent::PeerConnected(peer.id.clone())).await.ok();
                                     PeerState::Connected { noise }
                                 } else {
                                     PeerState::Handshaking { noise }
@@ -162,6 +163,7 @@ impl NetworkManager {
                             },
                             Ok(None) => {
                                 info!("Handshake with {} complete!", peer.name);
+                                net_event_tx.send(NetworkEvent::PeerConnected(peer.id.clone())).await.ok();
                                 PeerState::Connected { noise }
                             },
                             Err(e) => {
@@ -298,6 +300,34 @@ impl NetworkManager {
                             Err(e) => {
                                 error!("Failed to create responder for {}: {}", peer.name, e);
                                 PeerState::Discovered
+                            }
+                        }
+                    }
+                    MessageType::Message => {
+                        warn!("Received unencrypted Message from {}. This is deprecated. Initiating handshake.", peer.name);
+                        // Be robust to clients that send a message to trigger a connection,
+                        // which was a behaviour in early versions of the Swift client.
+                        match NoiseSession::new_initiator() {
+                            Ok((noise, init_msg)) => {
+                                let packet = BitchatPacket {
+                                    version: 1,
+                                    r#type: MessageType::NoiseHandshake,
+                                    ttl: 1,
+                                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                                    flags: protocol::PacketFlags::empty(),
+                                    sender_id: self_id,
+                                    recipient_id: None,
+                                    payload: init_msg,
+                                    signature: None,
+                                };
+                                let data_to_send = packet.to_bytes();
+                                ble_cmd_tx.send(BleCommand::SendData { receiver: peer.id.clone(), data: data_to_send }).await.ok();
+                                info!("Sent handshake initiation to {}", peer.name);
+                                PeerState::Handshaking { noise }
+                            }
+                            Err(e) => {
+                                error!("Failed to create initiator for {}: {}", peer.name, e);
+                                PeerState::Discovered // Revert state
                             }
                         }
                     }
