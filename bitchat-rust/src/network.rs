@@ -135,42 +135,57 @@ impl NetworkManager {
         let old_state = mem::replace(&mut peer.state, PeerState::Transitioning);
         let new_state = match old_state {
             PeerState::Handshaking { mut noise } => {
-                if packet.r#type == MessageType::NoiseHandshake {
-                    match noise.handshake_read(&packet.payload) {
-                        Ok(Some(reply_payload)) => {
-                            let reply_packet = BitchatPacket {
-                                version: 1,
-                                r#type: MessageType::NoiseHandshake,
-                                ttl: 1,
-                                timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                                flags: protocol::PacketFlags::empty(),
-                                sender_id: self_id,
-                                recipient_id: None,
-                                payload: reply_payload,
-                                signature: None,
-                            };
-                            let data_to_send = reply_packet.to_bytes();
-                            ble_cmd_tx.send(BleCommand::SendData { receiver: peer.id.clone(), data: data_to_send }).await.ok();
+                match packet.r#type {
+                    MessageType::NoiseHandshake => {
+                        match noise.handshake_read(&packet.payload) {
+                            Ok(Some(reply_payload)) => {
+                                let reply_packet = BitchatPacket {
+                                    version: 1,
+                                    r#type: MessageType::NoiseHandshake,
+                                    ttl: 1,
+                                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                                    flags: protocol::PacketFlags::empty(),
+                                    sender_id: self_id,
+                                    recipient_id: None,
+                                    payload: reply_payload,
+                                    signature: None,
+                                };
+                                let data_to_send = reply_packet.to_bytes();
+                                ble_cmd_tx.send(BleCommand::SendData { receiver: peer.id.clone(), data: data_to_send }).await.ok();
 
-                            if noise.is_transport_mode() {
+                                if noise.is_transport_mode() {
+                                    info!("Handshake with {} complete!", peer.name);
+                                    PeerState::Connected { noise }
+                                } else {
+                                    PeerState::Handshaking { noise }
+                                }
+                            },
+                            Ok(None) => {
                                 info!("Handshake with {} complete!", peer.name);
                                 PeerState::Connected { noise }
-                            } else {
-                                PeerState::Handshaking { noise }
-                            }
-                        },
-                        Ok(None) => {
-                            info!("Handshake with {} complete!", peer.name);
-                            PeerState::Connected { noise }
-                        },
-                        Err(e) => {
-                            warn!("Handshake error with {}: {}", peer.name, e);
-                            PeerState::Discovered
-                        },
+                            },
+                            Err(e) => {
+                                warn!("Handshake error with {}: {}", peer.name, e);
+                                PeerState::Discovered
+                            },
+                        }
                     }
-                } else {
-                    warn!("Received non-handshake packet of type {:?} during handshake from {}", packet.r#type, peer.name);
-                    PeerState::Handshaking { noise }
+                    MessageType::Announce => {
+                        info!("Received Announce from {} during handshake, processing it.", peer.name);
+                        if let Ok(announce) = AnnouncementPacket::from_bytes(&packet.payload) {
+                            peer.name = announce.nickname;
+                            peer.noise_public_key = Some(announce.noise_public_key.clone());
+                            peer.signing_public_key = Some(announce.signing_public_key);
+                            peer.bitchat_id = Some(derive_bitchat_id(&announce.noise_public_key));
+                            info!("Updated peer {} with bitchat_id {:?}", peer.name, peer.bitchat_id);
+                        }
+                        // Remain in the handshaking state
+                        PeerState::Handshaking { noise }
+                    }
+                    _ => {
+                        warn!("Received non-handshake packet of type {:?} during handshake from {}", packet.r#type, peer.name);
+                        PeerState::Handshaking { noise }
+                    }
                 }
             },
             PeerState::Connected { mut noise } => {
@@ -193,12 +208,32 @@ impl NetworkManager {
                     }
                     MessageType::NoiseEncrypted => {
                         match noise.decrypt(&packet.payload) {
-                            Ok(_plaintext) => {
-                                // TODO: Handle different NoisePayloadType values
-                                info!("Decrypted a NoiseEncrypted packet, but payload handling is not implemented yet.");
+                            Ok(plaintext) => {
+                                info!("Decrypted a NoiseEncrypted packet from {}", peer.name);
+                                // The plaintext should be another BitchatPacket
+                                match BitchatPacket::from_bytes(&plaintext) {
+                                    Ok(inner_packet) => {
+                                        // For now, we only handle inner Message types
+                                        if inner_packet.r#type == MessageType::Message {
+                                            if let Ok(message) = BitchatMessage::from_bytes(&inner_packet.payload) {
+                                                info!("Received message from {}: {}", peer.name, message.content);
+                                                // Use the peer's name from the outer context, not the one from the message.
+                                                let display_msg = format!("{}: {}", peer.name, message.content);
+                                                net_event_tx.send(NetworkEvent::NewMessage(display_msg)).await.ok();
+                                            } else {
+                                                warn!("Failed to decode BitchatMessage from inner packet from {}", peer.name);
+                                            }
+                                        } else {
+                                            warn!("Received unhandled inner packet type {:?} from {}", inner_packet.r#type, peer.name);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to decode inner BitchatPacket from {}: {}", peer.name, e);
+                                    }
+                                }
                             },
-                            Err(_) => {
-                                warn!("Failed to decrypt NoiseEncrypted message from {}", peer.name);
+                            Err(e) => {
+                                warn!("Failed to decrypt NoiseEncrypted message from {}: {}", peer.name, e);
                             }
                         }
                     }
@@ -209,19 +244,68 @@ impl NetworkManager {
                 PeerState::Connected { noise }
             },
             // If we are discovered, we shouldn't be receiving data yet. But if we do,
-            // it's likely an announce packet.
+            // it could be an announce or a handshake initiation.
             PeerState::Discovered => {
-                if packet.r#type == MessageType::Announce {
-                    info!("Received Announce from newly discovered peer {}", peer.name);
-                    if let Ok(announce) = AnnouncementPacket::from_bytes(&packet.payload) {
-                        peer.name = announce.nickname;
-                        peer.noise_public_key = Some(announce.noise_public_key.clone());
-                        peer.signing_public_key = Some(announce.signing_public_key);
-                        peer.bitchat_id = Some(derive_bitchat_id(&announce.noise_public_key));
-                        info!("Updated peer {} with bitchat_id {:?}", peer.name, peer.bitchat_id);
+                match packet.r#type {
+                    MessageType::Announce => {
+                        info!("Received Announce from newly discovered peer {}", peer.name);
+                        if let Ok(announce) = AnnouncementPacket::from_bytes(&packet.payload) {
+                            peer.name = announce.nickname;
+                            peer.noise_public_key = Some(announce.noise_public_key.clone());
+                            peer.signing_public_key = Some(announce.signing_public_key);
+                            peer.bitchat_id = Some(derive_bitchat_id(&announce.noise_public_key));
+                            info!("Updated peer {} with bitchat_id {:?}", peer.name, peer.bitchat_id);
+                        }
+                        PeerState::Discovered
+                    }
+                    MessageType::NoiseHandshake => {
+                        info!("Received handshake initiation from {}", peer.name);
+                        match NoiseSession::new_responder() {
+                            Ok(mut noise) => {
+                                match noise.handshake_read(&packet.payload) {
+                                    Ok(Some(reply_payload)) => {
+                                        let reply_packet = BitchatPacket {
+                                            version: 1,
+                                            r#type: MessageType::NoiseHandshake,
+                                            ttl: 1,
+                                            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                                            flags: protocol::PacketFlags::empty(),
+                                            sender_id: self_id,
+                                            recipient_id: None,
+                                            payload: reply_payload,
+                                            signature: None,
+                                        };
+                                        let data_to_send = reply_packet.to_bytes();
+                                        ble_cmd_tx.send(BleCommand::SendData { receiver: peer.id.clone(), data: data_to_send }).await.ok();
+                                        info!("Sent handshake response to {}", peer.name);
+                                        PeerState::Handshaking { noise }
+                                    }
+                                    Ok(None) => {
+                                        // This shouldn't happen for a responder on the first message
+                                        warn!("Handshake with {} completed prematurely.", peer.name);
+                                        if noise.is_transport_mode() {
+                                            PeerState::Connected { noise }
+                                        } else {
+                                            PeerState::Discovered
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Handshake error with {}: {}", peer.name, e);
+                                        PeerState::Discovered
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to create responder for {}: {}", peer.name, e);
+                                PeerState::Discovered
+                            }
+                        }
+                    }
+                    _ => {
+                        warn!("Received unexpected packet type {:?} from discovered peer {}", packet.r#type, peer.name);
+                        PeerState::Discovered
                     }
                 }
-                PeerState::Discovered
             }
             s => s, // Return original state for Transitioning
         };
@@ -231,41 +315,96 @@ impl NetworkManager {
     async fn handle_ui_command(&mut self, command: UiCommand) {
         match command {
             UiCommand::SendMessage(text) => {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                let message = BitchatMessage {
-                    flags: MessageFlags::empty(),
-                    timestamp: now,
-                    id: Uuid::new_v4(),
-                    sender: "Me".to_string(), // A real app would have a configurable nickname
-                    content: text,
-                    original_sender: None,
-                    recipient_nickname: None,
-                };
-
-                let packet = BitchatPacket {
-                    version: 1,
-                    r#type: MessageType::Message,
-                    ttl: 3,
-                    timestamp: now,
-                    flags: protocol::PacketFlags::empty(),
-                    sender_id: self.self_id,
-                    recipient_id: None, // None for broadcast
-                    payload: message.to_bytes(),
-                    signature: None,
-                };
-
-                let serialized_packet = packet.to_bytes();
-
+                let mut commands_to_send = Vec::new();
                 for peer in self.peers.values_mut() {
-                    if let PeerState::Connected { noise } = &mut peer.state {
-                        match noise.encrypt(&serialized_packet) {
-                            Ok(ciphertext) => {
-                                let cmd = BleCommand::SendData { receiver: peer.id.clone(), data: ciphertext };
-                                self.ble_cmd_tx.send(cmd).await.ok();
-                            },
-                            Err(_) => error!("Failed to encrypt message for {}", peer.name),
+                    let old_state = mem::replace(&mut peer.state, PeerState::Transitioning);
+                    let new_state = match old_state {
+                        PeerState::Connected { mut noise } => {
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                            let message = BitchatMessage {
+                                flags: MessageFlags::empty(),
+                                timestamp: now,
+                                id: Uuid::new_v4(),
+                                sender: "Me".to_string(),
+                                content: text.clone(),
+                                original_sender: None,
+                                recipient_nickname: None,
+                            };
+                            let inner_packet = BitchatPacket {
+                                version: 1,
+                                r#type: MessageType::Message,
+                                ttl: 3,
+                                timestamp: now,
+                                flags: protocol::PacketFlags::empty(),
+                                sender_id: self.self_id,
+                                recipient_id: None,
+                                payload: message.to_bytes(),
+                                signature: None,
+                            };
+
+                            match noise.encrypt(&inner_packet.to_bytes()) {
+                                Ok(encrypted_payload) => {
+                                    let outer_packet = BitchatPacket {
+                                        version: 1,
+                                        r#type: MessageType::NoiseEncrypted,
+                                        ttl: 1,
+                                        timestamp: now,
+                                        flags: protocol::PacketFlags::empty(),
+                                        sender_id: self.self_id,
+                                        recipient_id: peer.bitchat_id,
+                                        payload: encrypted_payload,
+                                        signature: None,
+                                    };
+                                    let data_to_send = outer_packet.to_bytes();
+                                    info!("Queueing encrypted message to {}", peer.name);
+                                    commands_to_send.push(BleCommand::SendData { receiver: peer.id.clone(), data: data_to_send });
+                                }
+                                Err(e) => {
+                                    error!("Failed to encrypt message for {}: {}", peer.name, e);
+                                }
+                            }
+                            PeerState::Connected { noise }
                         }
-                    }
+                        PeerState::Discovered => {
+                            info!("Peer {} is discovered. Initiating handshake.", peer.name);
+                            match NoiseSession::new_initiator() {
+                                Ok((noise, init_msg)) => {
+                                    let packet = BitchatPacket {
+                                        version: 1,
+                                        r#type: MessageType::NoiseHandshake,
+                                        ttl: 1,
+                                        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                                        flags: protocol::PacketFlags::empty(),
+                                        sender_id: self.self_id,
+                                        recipient_id: None,
+                                        payload: init_msg,
+                                        signature: None,
+                                    };
+                                    let data_to_send = packet.to_bytes();
+                                    info!("Queueing handshake initiation to {}. Please try sending message again later.", peer.name);
+                                    commands_to_send.push(BleCommand::SendData { receiver: peer.id.clone(), data: data_to_send });
+                                    PeerState::Handshaking { noise }
+                                }
+                                Err(e) => {
+                                    error!("Failed to create initiator for {}: {}", peer.name, e);
+                                    PeerState::Discovered // Revert state
+                                }
+                            }
+                        }
+                        other_state @ PeerState::Handshaking { .. } => {
+                            info!("Already handshaking with {}. Please wait.", peer.name);
+                            other_state
+                        }
+                        other_state => { // Catches Transitioning
+                            warn!("Not sending message to {} because peer state is not ready (state: transitioning or other).", peer.name);
+                            other_state
+                        }
+                    };
+                    peer.state = new_state;
+                }
+
+                for cmd in commands_to_send {
+                    self.ble_cmd_tx.send(cmd).await.ok();
                 }
             }
         }
