@@ -258,7 +258,32 @@ impl NetworkManager {
                             peer.bitchat_id = Some(derive_bitchat_id(&announce.noise_public_key));
                             info!("Updated peer {} with bitchat_id {:?}", peer.name, peer.bitchat_id);
                         }
-                        PeerState::Discovered
+
+                        // Proactively initiate handshake after receiving announce
+                        info!("Proactively initiating handshake with {}", peer.name);
+                        match NoiseSession::new_initiator() {
+                            Ok((noise, init_msg)) => {
+                                let packet = BitchatPacket {
+                                    version: 1,
+                                    r#type: MessageType::NoiseHandshake,
+                                    ttl: 1,
+                                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                                    flags: protocol::PacketFlags::empty(),
+                                    sender_id: self_id,
+                                    recipient_id: None,
+                                    payload: init_msg,
+                                    signature: None,
+                                };
+                                let data_to_send = packet.to_bytes();
+                                ble_cmd_tx.send(BleCommand::SendData { receiver: peer.id.clone(), data: data_to_send }).await.ok();
+                                info!("Sent handshake initiation to {}", peer.name);
+                                PeerState::Handshaking { noise }
+                            }
+                            Err(e) => {
+                                error!("Failed to create initiator for {}: {}", peer.name, e);
+                                PeerState::Discovered // Revert state
+                            }
+                        }
                     }
                     MessageType::NoiseHandshake => {
                         info!("Received handshake initiation from {}", peer.name);
