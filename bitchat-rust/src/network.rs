@@ -204,8 +204,10 @@ impl NetworkManager {
                     }
                     MessageType::Message => {
                         if let Ok(message) = BitchatMessage::from_bytes(&packet.payload) {
-                            let display_msg = format!("{}: {}", message.sender, message.content);
-                            net_event_tx.send(NetworkEvent::NewMessage(display_msg)).await.ok();
+                            net_event_tx.send(NetworkEvent::NewMessage {
+                                sender_id: peer.id.clone(),
+                                content: message.content,
+                            }).await.ok();
                         }
                     }
                     MessageType::NoiseEncrypted => {
@@ -219,9 +221,10 @@ impl NetworkManager {
                                         if inner_packet.r#type == MessageType::Message {
                                             if let Ok(message) = BitchatMessage::from_bytes(&inner_packet.payload) {
                                                 info!("Received message from {}: {}", peer.name, message.content);
-                                                // Use the peer's name from the outer context, not the one from the message.
-                                                let display_msg = format!("{}: {}", peer.name, message.content);
-                                                net_event_tx.send(NetworkEvent::NewMessage(display_msg)).await.ok();
+                                                net_event_tx.send(NetworkEvent::NewMessage {
+                                                    sender_id: peer.id.clone(),
+                                                    content: message.content,
+                                                }).await.ok();
                                             } else {
                                                 warn!("Failed to decode BitchatMessage from inner packet from {}", peer.name);
                                             }
@@ -485,7 +488,7 @@ pub enum NetworkEvent {
     PeerDiscovered { id: PeerMapKey, name: String },
     PeerConnected(PeerMapKey),
     PeerDisconnected(PeerMapKey),
-    NewMessage(String),
+    NewMessage { sender_id: PeerMapKey, content: String },
     StatusUpdate(String),
 }
 
