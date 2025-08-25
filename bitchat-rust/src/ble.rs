@@ -1,6 +1,6 @@
 //! Bluetooth Low Energy (BLE) communication task.
 
-use btleplug::api::{Central, Manager as _, ScanFilter, Peripheral as _, WriteType};
+use btleplug::api::{Central, Manager as _, ScanFilter, Peripheral as _, WriteType, CentralEvent, CharPropFlags};
 use btleplug::platform::{Manager, Peripheral};
 use tokio::sync::mpsc;
 use futures::stream::StreamExt;
@@ -9,8 +9,9 @@ use std::collections::HashMap;
 use uuid::Uuid;
 use crate::network::{BleCommand, BleEvent};
 
-// Custom characteristic UUID for Bitchat
-const BITCHAT_CHAR_UUID: Uuid = Uuid::from_u128(0xDEADBEEF_0000_0000_0000_0000_0000_0001);
+// UUIDs from the iOS/Android clients
+const SERVICE_UUID: Uuid = Uuid::from_u128(0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5C);
+const CHARACTERISTIC_UUID: Uuid = Uuid::from_u128(0xA1B2C3D4_E5F6_4A5B_8C9D_0E1F2A3B4C5D);
 
 /// Spawns a dedicated task to handle notifications from a single peripheral.
 async fn spawn_notification_handler(
@@ -20,24 +21,33 @@ async fn spawn_notification_handler(
     let peripheral_id = peripheral.id();
     info!("Starting notification handler for {:?}", peripheral_id);
 
-    // Subscribe to the characteristic
     if let Err(e) = peripheral.discover_services().await {
         error!("[{:?}] Failed to discover services: {}", peripheral_id, e);
         return;
     }
-    let chat_char = peripheral.characteristics().into_iter().find(|c| c.uuid == BITCHAT_CHAR_UUID);
+
+    let chat_char = peripheral.characteristics().into_iter().find(|c| c.uuid == CHARACTERISTIC_UUID);
+
     if let Some(c) = chat_char {
-        if let Err(e) = peripheral.subscribe(&c).await {
-            error!("[{:?}] Failed to subscribe to characteristic: {}", peripheral_id, e);
+        // Signal that we found the service and characteristic
+        event_tx.send(BleEvent::ServicesDiscovered(peripheral.id())).await.ok();
+
+        // Correctly check characteristic properties
+        if c.properties.contains(CharPropFlags::NOTIFY) {
+            if let Err(e) = peripheral.subscribe(&c).await {
+                error!("[{:?}] Failed to subscribe to characteristic: {}", peripheral_id, e);
+                return;
+            }
+            info!("[{:?}] Subscribed to Bitchat characteristic", peripheral_id);
+        } else {
+            warn!("[{:?}] Bitchat characteristic does not support notifications", peripheral_id);
             return;
         }
-        info!("[{:?}] Subscribed to Bitchat characteristic", peripheral_id);
     } else {
         warn!("[{:?}] Bitchat characteristic not found", peripheral_id);
         return;
     }
 
-    // Get the notification stream
     let mut notification_stream = match peripheral.notifications().await {
         Ok(stream) => stream,
         Err(e) => {
@@ -46,9 +56,8 @@ async fn spawn_notification_handler(
         }
     };
 
-    // Forward notifications as BleEvents
     while let Some(notification) = notification_stream.next().await {
-        if notification.uuid == BITCHAT_CHAR_UUID {
+        if notification.uuid == CHARACTERISTIC_UUID {
             event_tx.send(BleEvent::DataReceived {
                 sender: peripheral_id.clone(),
                 data: notification.value,
@@ -71,8 +80,11 @@ pub async fn ble_task(
 
     let mut peripherals: HashMap<btleplug::platform::PeripheralId, Peripheral> = HashMap::new();
 
-    central.start_scan(ScanFilter::default()).await.map_err(|e| e.to_string())?;
-    info!("Scanning for devices...");
+    let filter = ScanFilter {
+        services: vec![SERVICE_UUID],
+    };
+    central.start_scan(filter).await.map_err(|e| e.to_string())?;
+    info!("Scanning for Bitchat devices...");
 
     let mut central_events = central.events().await.map_err(|e| e.to_string())?;
 
@@ -80,27 +92,26 @@ pub async fn ble_task(
         tokio::select! {
             Some(event) = central_events.next() => {
                 match event {
-                    btleplug::api::CentralEvent::DeviceDiscovered(id) => {
+                    CentralEvent::DeviceDiscovered(id) => {
                         if let Ok(p) = central.peripheral(&id).await {
-                             if let Ok(Some(props)) = p.properties().await {
-                                if let Some(name) = props.local_name {
-                                    info!("Discovered device: {} ({:?})", name, id);
-                                    peripherals.insert(id.clone(), p);
-                                    event_tx.send(BleEvent::Discovered { id, name }).await.ok();
-                                }
-                            }
+                            let props = p.properties().await.unwrap_or(None);
+                            let name = props.and_then(|p| p.local_name).unwrap_or_else(|| "Bitchat Peer".to_string());
+
+                            info!("Discovered device: {} ({:?})", name, id);
+                            peripherals.insert(id.clone(), p);
+                            event_tx.send(BleEvent::Discovered { id, name }).await.ok();
                         }
                     },
-                    btleplug::api::CentralEvent::DeviceConnected(id) => {
+                    CentralEvent::DeviceConnected(id) => {
                         info!("Device connected: {:?}", id);
                         if let Some(p) = peripherals.get(&id) {
-                            // Spawn a task to handle this peripheral's notifications
                             tokio::spawn(spawn_notification_handler(p.clone(), event_tx.clone()));
                         }
                         event_tx.send(BleEvent::Connected(id)).await.ok();
                     },
-                    btleplug::api::CentralEvent::DeviceDisconnected(id) => {
+                    CentralEvent::DeviceDisconnected(id) => {
                         info!("Device disconnected: {:?}", id);
+                        peripherals.remove(&id);
                         event_tx.send(BleEvent::Disconnected(id)).await.ok();
                     },
                     _ => {}
@@ -126,7 +137,7 @@ pub async fn ble_task(
                         if let Some(p) = peripherals.get(&receiver) {
                             if p.is_connected().await.unwrap_or(false) {
                                 let chat_char = p.characteristics().into_iter()
-                                    .find(|c| c.uuid == BITCHAT_CHAR_UUID);
+                                    .find(|c| c.uuid == CHARACTERISTIC_UUID);
                                 if let Some(c) = chat_char {
                                     if let Err(e) = p.write(&c, &data, WriteType::WithoutResponse).await {
                                         error!("Failed to write to characteristic: {}", e);
