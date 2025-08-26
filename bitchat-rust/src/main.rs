@@ -1,17 +1,37 @@
-use eframe::egui;
+use eframe::egui::{self, Margin};
 use tokio::sync::mpsc;
 use std::collections::HashMap;
+use tracing::info;
+use chrono::{DateTime, Utc};
 
 use crate::network::{NetworkManager, UiCommand, NetworkEvent, PeerMapKey};
+use crate::identity::UserIdentity;
 
 pub mod protocol;
 pub mod noise;
 pub mod ble;
 pub mod network;
+pub mod identity;
+
+const IDENTITY_FILE: &str = "bitchat_identity.bin";
 
 #[tokio::main]
 async fn main() -> Result<(), eframe::Error> {
     tracing_subscriber::fmt::init();
+
+    let identity = match UserIdentity::load_from_file(IDENTITY_FILE) {
+        Ok(id) => {
+            info!("Loaded identity from {}", IDENTITY_FILE);
+            id
+        },
+        Err(_) => {
+            info!("No identity file found, generating a new one...");
+            let id = UserIdentity::generate().expect("Failed to generate identity");
+            id.save_to_file(IDENTITY_FILE).expect("Failed to save identity file");
+            info!("Saved new identity to {}", IDENTITY_FILE);
+            id
+        }
+    };
 
     // Create channels for communication between threads
     let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel(32);
@@ -27,7 +47,7 @@ async fn main() -> Result<(), eframe::Error> {
     });
 
     // Spawn the NetworkManager task
-    let mut network_manager = NetworkManager::new(ble_cmd_tx, net_event_tx, ui_cmd_rx, ble_event_rx);
+    let mut network_manager = NetworkManager::new(identity, ble_cmd_tx, net_event_tx, ui_cmd_rx, ble_event_rx);
     tokio::spawn(async move {
         network_manager.run().await;
     });
@@ -94,8 +114,15 @@ struct PeerInfo {
     status: String,
 }
 
+struct ChatMessage {
+    is_self: bool,
+    sender: String,
+    content: String,
+    timestamp: DateTime<Utc>,
+}
+
 struct MyApp {
-    message_history: Vec<(Option<PeerMapKey>, String)>,
+    message_history: Vec<ChatMessage>,
     input_text: String,
     peers: HashMap<PeerMapKey, PeerInfo>,
     status: String,
@@ -108,7 +135,12 @@ struct MyApp {
 impl MyApp {
     fn new(ui_cmd_tx: mpsc::Sender<UiCommand>, net_event_rx: mpsc::Receiver<NetworkEvent>) -> Self {
         Self {
-            message_history: vec![(None, "Welcome to BitChat!".to_owned())],
+            message_history: vec![ChatMessage {
+                is_self: false,
+                sender: "System".to_string(),
+                content: "Welcome to BitChat!".to_string(),
+                timestamp: Utc::now(),
+            }],
             input_text: "".to_owned(),
             peers: HashMap::new(),
             status: "Initializing...".to_owned(),
@@ -123,7 +155,12 @@ impl MyApp {
         if !self.input_text.is_empty() {
             let text = self.input_text.clone();
             self.ui_cmd_tx.try_send(UiCommand::SendMessage(text.clone())).ok();
-            self.message_history.push((None, text));
+            self.message_history.push(ChatMessage {
+                is_self: true,
+                sender: self.username.clone(),
+                content: text,
+                timestamp: Utc::now(),
+            });
             self.input_text.clear();
         }
     }
@@ -147,8 +184,14 @@ impl eframe::App for MyApp {
                         peer.status = "Disconnected".to_string();
                     }
                 },
-                NetworkEvent::NewMessage { sender_id, content } => {
-                    self.message_history.push((Some(sender_id), content));
+                NetworkEvent::NewMessage { sender_id: _, sender_name, content, timestamp } => {
+                    let dt = DateTime::from_timestamp_millis(timestamp as i64).unwrap_or_else(|| Utc::now());
+                    self.message_history.push(ChatMessage {
+                        is_self: false,
+                        sender: sender_name,
+                        content,
+                        timestamp: dt,
+                    });
                 },
                 NetworkEvent::StatusUpdate(status) => {
                     self.status = status;
@@ -214,29 +257,39 @@ impl eframe::App for MyApp {
         // Main Chat Panel
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                for (sender_id, message) in &self.message_history {
-                    let (is_self, nickname) = match sender_id {
-                        Some(id) => (false, self.peers.get(id).map_or("unknown", |p| &p.name)),
-                        None => (true, self.username.as_str()),
-                    };
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    for msg in &self.message_history {
+                        let layout = if msg.is_self {
+                            egui::Layout::right_to_left(egui::Align::TOP).with_main_wrap(true)
+                        } else {
+                            egui::Layout::left_to_right(egui::Align::TOP).with_main_wrap(true)
+                        };
 
-                    let layout = if is_self {
-                        egui::Layout::right_to_left(egui::Align::TOP)
-                    } else {
-                        egui::Layout::left_to_right(egui::Align::TOP)
-                    };
+                        ui.with_layout(layout, |ui| {
+                            let bg_color = if msg.is_self {
+                                egui::Color32::from_hex("#0A84FF").unwrap()
+                            } else {
+                                egui::Color32::from_hex("#3A3A3C").unwrap()
+                            };
 
-                    ui.with_layout(layout, |ui| {
-                        ui.horizontal(|ui| {
-                            // Timestamp
-                            ui.label(egui::RichText::new("12:34").color(egui::Color32::from_rgb(142, 142, 147)));
-                            // Nickname
-                            ui.label(egui::RichText::new(nickname).strong());
-                            // Message
-                            ui.label(message);
+                            let frame = egui::Frame::default()
+                                .inner_margin(Margin::same(8.0))
+                                .rounding(egui::Rounding::same(12.0))
+                                .fill(bg_color);
+
+                            frame.show(ui, |ui| {
+                                ui.set_max_width(300.0);
+                                ui.label(&msg.content);
+                            });
+
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(&msg.sender).strong());
+                                ui.label(egui::RichText::new(msg.timestamp.format("%H:%M").to_string()).color(egui::Color32::GRAY));
+                            });
                         });
-                    });
-                }
+                        ui.add_space(10.0);
+                    }
+                });
             });
         });
 

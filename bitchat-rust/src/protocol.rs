@@ -333,6 +333,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_fragment_packet_roundtrip() {
+        let packet = FragmentPacket {
+            id: Uuid::new_v4(),
+            index: 1,
+            count: 5,
+            data: vec![1, 2, 3, 4, 5],
+        };
+
+        let encoded = packet.to_bytes();
+        let decoded = FragmentPacket::from_bytes(&encoded).unwrap();
+
+        assert_eq!(packet, decoded);
+    }
+
+    #[test]
+    fn test_announce_packet_roundtrip() {
+        let packet = AnnouncementPacket {
+            nickname: "Alice".to_string(),
+            noise_public_key: vec![1; 32],
+            signing_public_key: vec![2; 32],
+        };
+
+        let encoded = packet.to_bytes();
+        let decoded = AnnouncementPacket::from_bytes(&encoded).unwrap();
+
+        assert_eq!(packet, decoded);
+    }
+
+    #[test]
     fn test_bitchat_message_roundtrip() {
         let message = BitchatMessage {
             flags: MessageFlags::IS_PRIVATE | MessageFlags::HAS_RECIPIENT_NICKNAME,
@@ -404,6 +433,42 @@ mod tests {
 
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct FragmentPacket {
+    pub id: Uuid,
+    pub index: u16,
+    pub count: u16,
+    pub data: Vec<u8>,
+}
+
+impl FragmentPacket {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(self.id.as_bytes());
+        bytes.extend_from_slice(&self.index.to_be_bytes());
+        bytes.extend_from_slice(&self.count.to_be_bytes());
+        bytes.extend_from_slice(&self.data);
+        bytes
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 20 { // 16 for Uuid + 2 for index + 2 for count
+            return Err("Data too short for FragmentPacket".to_string());
+        }
+        let id = Uuid::from_slice(&data[0..16]).map_err(|e| e.to_string())?;
+        let index = u16::from_be_bytes(data[16..18].try_into().unwrap());
+        let count = u16::from_be_bytes(data[18..20].try_into().unwrap());
+        let fragment_data = data[20..].to_vec();
+
+        Ok(FragmentPacket {
+            id,
+            index,
+            count,
+            data: fragment_data,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct AnnouncementPacket {
     pub nickname: String,
     pub noise_public_key: Vec<u8>,
@@ -411,6 +476,30 @@ pub struct AnnouncementPacket {
 }
 
 impl AnnouncementPacket {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut data = Vec::new();
+
+        // Nickname (Type 0x01)
+        if !self.nickname.is_empty() {
+            data.push(0x01);
+            let nickname_bytes = self.nickname.as_bytes();
+            data.push(nickname_bytes.len() as u8); // Assuming length fits in a u8
+            data.extend_from_slice(nickname_bytes);
+        }
+
+        // Noise Public Key (Type 0x02)
+        data.push(0x02);
+        data.push(self.noise_public_key.len() as u8);
+        data.extend_from_slice(&self.noise_public_key);
+
+        // Signing Public Key (Type 0x03)
+        data.push(0x03);
+        data.push(self.signing_public_key.len() as u8);
+        data.extend_from_slice(&self.signing_public_key);
+
+        data
+    }
+
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         let mut offset = 0;
         let mut nickname: Option<String> = None;

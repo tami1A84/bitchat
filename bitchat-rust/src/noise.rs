@@ -17,10 +17,9 @@ enum NoiseState {
 
 impl NoiseSession {
     /// Create a new Noise session as the initiator.
-    pub fn new_initiator() -> Result<(Self, Vec<u8>), snow::Error> {
+    pub fn new_initiator(local_private_key: &[u8]) -> Result<(Self, Vec<u8>), snow::Error> {
         let builder = Builder::new(NOISE_PARAMS.parse()?);
-        let keypair = builder.generate_keypair()?;
-        let mut handshake = builder.local_private_key(&keypair.private).build_initiator()?;
+        let mut handshake = builder.local_private_key(local_private_key).build_initiator()?;
 
         // Perform the first step of the XX handshake (-> e)
         let mut first_msg = vec![0u8; 200];
@@ -36,10 +35,9 @@ impl NoiseSession {
     }
 
     /// Create a new Noise session as the responder.
-    pub fn new_responder() -> Result<Self, snow::Error> {
+    pub fn new_responder(local_private_key: &[u8]) -> Result<Self, snow::Error> {
         let builder = Builder::new(NOISE_PARAMS.parse()?);
-        let keypair = builder.generate_keypair()?;
-        let handshake = builder.local_private_key(&keypair.private).build_responder()?;
+        let handshake = builder.local_private_key(local_private_key).build_responder()?;
         Ok(Self {
             state: NoiseState::Handshake(handshake),
         })
@@ -113,11 +111,16 @@ mod tests {
 
     #[test]
     fn test_full_handshake_and_transport() {
+        // 0. Generate keypairs for the test
+        let builder = Builder::new(NOISE_PARAMS.parse().unwrap());
+        let initiator_keys = builder.generate_keypair().unwrap();
+        let responder_keys = builder.generate_keypair().unwrap();
+
         // 1. Initiator starts
-        let (mut initiator, init_msg) = NoiseSession::new_initiator().unwrap();
+        let (mut initiator, init_msg) = NoiseSession::new_initiator(&initiator_keys.private).unwrap();
 
         // 2. Responder receives the first message
-        let mut responder = NoiseSession::new_responder().unwrap();
+        let mut responder = NoiseSession::new_responder(&responder_keys.private).unwrap();
         let resp_msg = responder.handshake_read(&init_msg).unwrap().unwrap();
 
         // 3. Initiator receives the response
