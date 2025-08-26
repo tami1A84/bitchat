@@ -13,6 +13,9 @@ pub mod ble;
 pub mod network;
 pub mod identity;
 
+#[cfg(feature = "geohash")]
+pub mod geohash;
+
 const IDENTITY_FILE: &str = "bitchat_identity.bin";
 
 #[tokio::main]
@@ -51,6 +54,14 @@ async fn main() -> Result<(), eframe::Error> {
     tokio::spawn(async move {
         network_manager.run().await;
     });
+
+    #[cfg(feature = "geohash")]
+    {
+        if let Ok(hash) = geohash::get_current_geohash() {
+            println!("Current Geohash: {}", hash);
+            // 将来的に、このハッシュをパケットに含める
+        }
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -202,7 +213,7 @@ impl eframe::App for MyApp {
         // Header
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("#public").font(egui::FontId::proportional(17.0)).strong());
+                ui.label(egui::RichText::new("#mesh").font(egui::FontId::proportional(17.0)).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let users_button = ui.add(egui::Button::new(egui::RichText::new("👥").size(20.0)).frame(false));
                     if users_button.clicked() {
