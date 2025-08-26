@@ -1,7 +1,8 @@
 //! Manages the network layer, including peers, connections, and message routing.
 
+use crate::compression;
 use crate::noise::NoiseSession;
-use crate::protocol::{BitchatMessage, BitchatPacket, FragmentPacket, MessageFlags, MessageType, self, AnnouncementPacket};
+use crate::protocol::{BitchatMessage, BitchatPacket, FragmentPacket, MessageFlags, MessageType, self, AnnouncementPacket, PacketFlags};
 use std::collections::{HashMap, HashSet};
 use btleplug::platform::PeripheralId;
 use sha2::{Sha256, Digest};
@@ -286,7 +287,19 @@ impl NetworkManager {
                             Ok(plaintext) => {
                                 if let Ok(inner_packet) = BitchatPacket::from_bytes(&plaintext) {
                                     if inner_packet.r#type == MessageType::Message {
-                                        if let Ok(message) = BitchatMessage::from_bytes(&inner_packet.payload) {
+                                        let message_payload_vec = if inner_packet.flags.contains(PacketFlags::IS_COMPRESSED) {
+                                            match compression::decompress(&inner_packet.payload) {
+                                                Ok(decompressed) => decompressed,
+                                                Err(e) => {
+                                                    warn!("Failed to decompress message from {}: {}", peer.name, e);
+                                                    return None;
+                                                }
+                                            }
+                                        } else {
+                                            inner_packet.payload
+                                        };
+
+                                        if let Ok(message) = BitchatMessage::from_bytes(&message_payload_vec) {
                                             if seen_messages.insert(message.id) {
                                                 info!("Received message {} from {}", message.id, peer.name);
                                                 net_event_tx.send(NetworkEvent::NewMessage {
@@ -524,78 +537,18 @@ impl NetworkManager {
                 let mut packets_to_send = Vec::new();
 
                 for peer in self.peers.values_mut() {
-                    let old_state = mem::replace(&mut peer.state, PeerState::Transitioning);
-                    let (new_state, packet_opt) = match old_state {
-                        PeerState::Connected { mut noise } => {
-                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                            let message = BitchatMessage {
-                                flags: MessageFlags::empty(),
-                                timestamp: now,
-                                id: Uuid::new_v4(),
-                                sender: "Me".to_string(), // TODO: Use profile nickname
-                                content: text.clone(),
-                                original_sender: None,
-                                recipient_nickname: None,
-                            };
-                            let inner_packet = BitchatPacket {
-                                version: 1,
-                                r#type: MessageType::Message,
-                                ttl: 3,
-                                timestamp: now,
-                                flags: protocol::PacketFlags::empty(),
-                                sender_id: self_bitchat_id,
-                                recipient_id: None,
-                                payload: message.to_bytes(),
-                                signature: None,
-                            };
+                    if !matches!(peer.state, PeerState::Connected { .. }) {
+                        continue; // Skip peers that are not fully connected
+                    }
 
-                            let packet = if let Ok(encrypted_payload) = noise.encrypt(&inner_packet.to_bytes()) {
-                                Some(BitchatPacket {
-                                    version: 1,
-                                    r#type: MessageType::NoiseEncrypted,
-                                    ttl: 1,
-                                    timestamp: now,
-                                    flags: protocol::PacketFlags::empty(),
-                                    sender_id: self_bitchat_id,
-                                    recipient_id: peer.bitchat_id,
-                                    payload: encrypted_payload,
-                                    signature: None,
-                                })
-                            } else {
-                                error!("Failed to encrypt message for {}", peer.name);
-                                None
-                            };
-                            (PeerState::Connected { noise }, packet)
-                        }
-                        PeerState::Discovered => {
-                            info!("Peer {} is discovered. Initiating handshake.", peer.name);
-                            if let Ok((noise, init_msg)) = NoiseSession::new_initiator(&self.identity.noise_keypair.private) {
-                                let packet = BitchatPacket {
-                                    version: 1,
-                                    r#type: MessageType::NoiseHandshake,
-                                    ttl: 1,
-                                    timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
-                                    flags: protocol::PacketFlags::empty(),
-                                    sender_id: self_bitchat_id,
-                                    recipient_id: None,
-                                    payload: init_msg,
-                                    signature: None,
-                                };
-                                (PeerState::Handshaking { noise }, Some(packet))
-                            } else {
-                                error!("Failed to create initiator for {}: {}", peer.name, "unknown error");
-                                (PeerState::Discovered, None)
-                            }
-                        }
-                        other_state @ PeerState::Handshaking { .. } => {
-                            info!("Already handshaking with {}. Please wait.", peer.name);
-                            (other_state, None)
-                        }
-                        other_state => { // Catches Transitioning
-                            warn!("Not sending message to {} because peer state is not ready (state: transitioning or other).", peer.name);
-                            (other_state, None)
-                        }
+                    let old_state = mem::replace(&mut peer.state, PeerState::Transitioning);
+                    let (new_state, packet_opt) = if let PeerState::Connected { mut noise } = old_state {
+                        let packet = create_encrypted_message_packet(&mut noise, &text, self_bitchat_id, peer.bitchat_id);
+                        (PeerState::Connected { noise }, packet)
+                    } else {
+                        (old_state, None) // Should not happen due to the check above
                     };
+
                     peer.state = new_state;
                     if let Some(packet) = packet_opt {
                         packets_to_send.push((packet, peer.id.clone()));
@@ -606,7 +559,84 @@ impl NetworkManager {
                     self.send_packet_fragmented(packet, receiver_id).await;
                 }
             }
+            UiCommand::SendPrivateMessage { recipient, text } => {
+                let self_bitchat_id = self.self_bitchat_id();
+                let packet_to_send = {
+                    if let Some(peer) = self.peers.get_mut(&recipient) {
+                        if let PeerState::Connected { ref mut noise } = peer.state {
+                            create_encrypted_message_packet(noise, &text, self_bitchat_id, peer.bitchat_id)
+                        } else {
+                            warn!("Cannot send private message to {}: peer not connected.", peer.name);
+                            None
+                        }
+                    } else {
+                        warn!("Cannot send private message: recipient not found.");
+                        None
+                    }
+                };
+
+                if let Some(packet) = packet_to_send {
+                    self.send_packet_fragmented(packet, recipient).await;
+                }
+            }
         }
+    }
+}
+
+fn create_encrypted_message_packet(noise: &mut NoiseSession, text: &str, sender_id: [u8; 8], recipient_id: Option<[u8; 8]>) -> Option<BitchatPacket> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let message = BitchatMessage {
+        flags: MessageFlags::empty(),
+        timestamp: now,
+        id: Uuid::new_v4(),
+        sender: "Me".to_string(), // TODO: Use profile nickname
+        content: text.to_string(),
+        original_sender: None,
+        recipient_nickname: None,
+    };
+
+    let message_bytes = message.to_bytes();
+    let (payload, mut flags) = if message_bytes.len() > 64 { // Only compress if payload is somewhat large
+        (compression::compress(&message_bytes), PacketFlags::IS_COMPRESSED)
+    } else {
+        (message_bytes, PacketFlags::empty())
+    };
+
+    if recipient_id.is_some() {
+        flags |= PacketFlags::HAS_RECIPIENT;
+    }
+
+    let inner_packet = BitchatPacket {
+        version: 1,
+        r#type: MessageType::Message,
+        ttl: if recipient_id.is_some() { 1 } else { 3 }, // Lower TTL for private messages
+        timestamp: now,
+        flags,
+        sender_id,
+        recipient_id,
+        payload,
+        signature: None,
+    };
+
+    if let Ok(encrypted_payload) = noise.encrypt(&inner_packet.to_bytes()) {
+        let mut outer_flags = PacketFlags::empty();
+        if recipient_id.is_some() {
+            outer_flags |= PacketFlags::HAS_RECIPIENT;
+        }
+        Some(BitchatPacket {
+            version: 1,
+            r#type: MessageType::NoiseEncrypted,
+            ttl: 1,
+            timestamp: now,
+            flags: outer_flags,
+            sender_id,
+            recipient_id,
+            payload: encrypted_payload,
+            signature: None,
+        })
+    } else {
+        error!("Failed to encrypt message.");
+        None
     }
 }
 
@@ -622,6 +652,10 @@ fn derive_bitchat_id(public_key: &[u8]) -> [u8; 8] {
 #[derive(Debug)]
 pub enum UiCommand {
     SendMessage(String),
+    SendPrivateMessage {
+        recipient: PeerMapKey,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]

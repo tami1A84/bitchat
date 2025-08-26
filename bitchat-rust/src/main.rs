@@ -1,17 +1,21 @@
 use eframe::egui::{self, Margin};
 use tokio::sync::mpsc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use tracing::info;
 use chrono::{DateTime, Utc};
 
 use crate::network::{NetworkManager, UiCommand, NetworkEvent, PeerMapKey};
 use crate::identity::UserIdentity;
+use crate::command::{process_command, Command};
 
 pub mod protocol;
 pub mod noise;
 pub mod ble;
 pub mod network;
 pub mod identity;
+pub mod command;
+pub mod compression;
 
 #[cfg(feature = "geohash")]
 pub mod geohash;
@@ -120,6 +124,7 @@ async fn main() -> Result<(), eframe::Error> {
     )
 }
 
+#[derive(Clone)]
 struct PeerInfo {
     name: String,
     status: String,
@@ -141,6 +146,12 @@ struct MyApp {
     net_event_rx: mpsc::Receiver<NetworkEvent>,
     show_user_list: bool,
     username: String,
+    private_chat_peer: Option<PeerMapKey>,
+    active_chat_name: String,
+    blocked_peers: HashSet<PeerMapKey>,
+    favorite_peers: HashSet<PeerMapKey>,
+    wipe_button_clicks: u8,
+    last_wipe_click_time: Option<Instant>,
 }
 
 impl MyApp {
@@ -159,21 +170,191 @@ impl MyApp {
             net_event_rx,
             show_user_list: false,
             username: "user".to_owned(),
+            private_chat_peer: None,
+            active_chat_name: "#mesh".to_string(),
+            blocked_peers: HashSet::new(),
+            favorite_peers: HashSet::new(),
+            wipe_button_clicks: 0,
+            last_wipe_click_time: None,
         }
     }
 
     fn send_message(&mut self) {
-        if !self.input_text.is_empty() {
-            let text = self.input_text.clone();
-            self.ui_cmd_tx.try_send(UiCommand::SendMessage(text.clone())).ok();
+        if self.input_text.is_empty() {
+            return;
+        }
+
+        let text = self.input_text.trim().to_string();
+        self.input_text.clear();
+
+        if text.starts_with('/') {
+            match process_command(&text) {
+                Ok(command) => self.handle_command(command),
+                Err(e) => self.add_system_message(e.to_string()),
+            }
+        } else {
+            // Context-aware message sending
+            if let Some(peer_id) = self.private_chat_peer.clone() {
+                // We are in a private chat
+                self.ui_cmd_tx.try_send(UiCommand::SendPrivateMessage { recipient: peer_id, text: text.clone() }).ok();
+            } else {
+                // We are in the public channel
+                self.ui_cmd_tx.try_send(UiCommand::SendMessage(text.clone())).ok();
+            }
+
             self.message_history.push(ChatMessage {
                 is_self: true,
                 sender: self.username.clone(),
                 content: text,
                 timestamp: Utc::now(),
             });
-            self.input_text.clear();
         }
+    }
+
+    fn handle_command(&mut self, command: Command) {
+        match command {
+            Command::Help => {
+                let help_text = "Commands:\n\
+                                 /msg @name [message] - Send a private message\n\
+                                 /who - List online users\n\
+                                 /clear - Clear message history\n\
+                                 /hug @name - Send a hug\n\
+                                 /slap @name - Slap someone with a trout\n\
+                                 /block @name - Block a user\n\
+                                 /unblock @name - Unblock a user\n\
+                                 /fav @name - Add user to favorites\n\
+                                 /unfav @name - Remove user from favorites\n\
+                                 /help - Show this help message";
+                self.add_system_message(help_text.to_string());
+            }
+            Command::Who => {
+                if self.peers.is_empty() {
+                    self.add_system_message("No one else is online right now.".to_string());
+                } else {
+                    let peer_list = self.peers.values()
+                        .map(|p| p.name.clone())
+                        .collect::<Vec<String>>()
+                        .join(", ");
+                    self.add_system_message(format!("Online: {}", peer_list));
+                }
+            }
+            Command::Msg { nickname, message } => {
+                if nickname == "#mesh" {
+                    self.private_chat_peer = None;
+                    self.active_chat_name = "#mesh".to_string();
+                    self.add_system_message("Joined #mesh".to_string());
+                    return;
+                }
+
+                let target_peer_id = self.peers.iter().find(|(_, info)| info.name == nickname).map(|(id, _)| id.clone());
+
+                if let Some(id) = target_peer_id {
+                    self.private_chat_peer = Some(id.clone());
+                    self.active_chat_name = format!("@{}", nickname);
+                    self.add_system_message(format!("Started private chat with @{}", nickname));
+
+                    if let Some(text) = message {
+                        self.ui_cmd_tx.try_send(UiCommand::SendPrivateMessage { recipient: id, text: text.clone() }).ok();
+                        self.message_history.push(ChatMessage {
+                            is_self: true,
+                            sender: self.username.clone(),
+                            content: text,
+                            timestamp: Utc::now(),
+                        });
+                    }
+                } else {
+                    self.add_system_message(format!("User '{}' not found.", nickname));
+                }
+            }
+            Command::Clear => {
+                self.message_history.clear();
+            }
+            Command::Hug { nickname } => {
+                let message = format!("* 🫂 {} hugs {} *", self.username, nickname);
+                // For now, this is a local message. Later it should be sent over the network.
+                self.add_system_message(message);
+            }
+            Command::Slap { nickname } => {
+                let message = format!("* 🐟 {} slaps {} around a bit with a large trout *", self.username, nickname);
+                self.add_system_message(message);
+            }
+            Command::Block { nickname } => {
+                if let Some((id, _)) = self.find_peer_by_name(&nickname) {
+                    self.blocked_peers.insert(id);
+                    self.add_system_message(format!("Blocked {}.", nickname));
+                } else {
+                    self.add_system_message(format!("User '{}' not found.", nickname));
+                }
+            }
+            Command::Unblock { nickname } => {
+                if let Some((id, _)) = self.find_peer_by_name(&nickname) {
+                    if self.blocked_peers.remove(&id) {
+                        self.add_system_message(format!("Unblocked {}.", nickname));
+                    } else {
+                        self.add_system_message(format!("{} was not blocked.", nickname));
+                    }
+                } else {
+                    self.add_system_message(format!("User '{}' not found.", nickname));
+                }
+            }
+            Command::Fav { nickname } => {
+                if let Some((id, _)) = self.find_peer_by_name(&nickname) {
+                    self.favorite_peers.insert(id);
+                    self.add_system_message(format!("Added {} to favorites.", nickname));
+                } else {
+                    self.add_system_message(format!("User '{}' not found.", nickname));
+                }
+            }
+            Command::Unfav { nickname } => {
+                if let Some((id, _)) = self.find_peer_by_name(&nickname) {
+                    if self.favorite_peers.remove(&id) {
+                        self.add_system_message(format!("Removed {} from favorites.", nickname));
+                    } else {
+                        self.add_system_message(format!("{} was not a favorite.", nickname));
+                    }
+                } else {
+                    self.add_system_message(format!("User '{}' not found.", nickname));
+                }
+            }
+        }
+    }
+
+    fn find_peer_by_name(&self, nickname: &str) -> Option<(PeerMapKey, PeerInfo)> {
+        self.peers.iter()
+            .find(|(_, info)| info.name == nickname)
+            .map(|(id, info)| (id.clone(), info.clone()))
+    }
+
+    fn wipe_data(&mut self) {
+        // Clear all in-memory state
+        self.message_history.clear();
+        self.peers.clear();
+        self.blocked_peers.clear();
+        self.favorite_peers.clear();
+        self.private_chat_peer = None;
+        self.active_chat_name = "#mesh".to_string();
+        self.status = "DATA WIPED".to_string();
+
+        // Attempt to delete the identity file
+        match std::fs::remove_file(IDENTITY_FILE) {
+            Ok(_) => {
+                self.add_system_message("Identity file wiped.".to_string());
+            }
+            Err(e) => {
+                self.add_system_message(format!("Could not wipe identity file: {}", e));
+            }
+        }
+
+        self.add_system_message("All data has been wiped. Please restart the application.".to_string());
+    }
+
+    fn add_system_message(&mut self, content: String) {
+        self.message_history.push(ChatMessage {
+            is_self: false,
+            sender: "System".to_string(),
+            content,
+            timestamp: Utc::now(),
+        });
     }
 }
 
@@ -195,14 +376,16 @@ impl eframe::App for MyApp {
                         peer.status = "Disconnected".to_string();
                     }
                 },
-                NetworkEvent::NewMessage { sender_id: _, sender_name, content, timestamp } => {
-                    let dt = DateTime::from_timestamp_millis(timestamp as i64).unwrap_or_else(|| Utc::now());
-                    self.message_history.push(ChatMessage {
-                        is_self: false,
-                        sender: sender_name,
-                        content,
-                        timestamp: dt,
-                    });
+                NetworkEvent::NewMessage { sender_id, sender_name, content, timestamp } => {
+                    if !self.blocked_peers.contains(&sender_id) {
+                        let dt = DateTime::from_timestamp_millis(timestamp as i64).unwrap_or_else(|| Utc::now());
+                        self.message_history.push(ChatMessage {
+                            is_self: false,
+                            sender: sender_name,
+                            content,
+                            timestamp: dt,
+                        });
+                    }
                 },
                 NetworkEvent::StatusUpdate(status) => {
                     self.status = status;
@@ -213,7 +396,7 @@ impl eframe::App for MyApp {
         // Header
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("#mesh").font(egui::FontId::proportional(17.0)).strong());
+                ui.label(egui::RichText::new(&self.active_chat_name).font(egui::FontId::proportional(17.0)).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let users_button = ui.add(egui::Button::new(egui::RichText::new("👥").size(20.0)).frame(false));
                     if users_button.clicked() {
@@ -239,6 +422,29 @@ impl eframe::App for MyApp {
 
                 for (_id, peer) in &self.peers {
                     ui.label(format!("{} ({})", peer.name, peer.status));
+                }
+
+                ui.separator();
+                let wipe_button = ui.button("Wipe Data");
+                if wipe_button.clicked() {
+                    let now = Instant::now();
+                    if let Some(last_click) = self.last_wipe_click_time {
+                        if now.duration_since(last_click).as_secs_f32() < 1.5 {
+                            self.wipe_button_clicks += 1;
+                        } else {
+                            self.wipe_button_clicks = 1;
+                        }
+                    } else {
+                        self.wipe_button_clicks = 1;
+                    }
+                    self.last_wipe_click_time = Some(now);
+
+                    if self.wipe_button_clicks >= 3 {
+                        self.wipe_data();
+                        self.wipe_button_clicks = 0;
+                    } else {
+                         self.add_system_message(format!("Click {} more times to wipe data.", 3 - self.wipe_button_clicks));
+                    }
                 }
             });
         }
