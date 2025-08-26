@@ -201,7 +201,7 @@ impl MyApp {
                 // We are in the public channel
                 self.ui_cmd_tx.try_send(UiCommand::SendMessage(text.clone())).ok();
             }
-
+            
             self.message_history.push(ChatMessage {
                 is_self: true,
                 sender: self.username.clone(),
@@ -214,17 +214,7 @@ impl MyApp {
     fn handle_command(&mut self, command: Command) {
         match command {
             Command::Help => {
-                let help_text = "Commands:\n\
-                                 /msg @name [message] - Send a private message\n\
-                                 /who - List online users\n\
-                                 /clear - Clear message history\n\
-                                 /hug @name - Send a hug\n\
-                                 /slap @name - Slap someone with a trout\n\
-                                 /block @name - Block a user\n\
-                                 /unblock @name - Unblock a user\n\
-                                 /fav @name - Add user to favorites\n\
-                                 /unfav @name - Remove user from favorites\n\
-                                 /help - Show this help message";
+                let help_text = "Commands:\n                                 /msg @name [message] - Send a private message\n                                 /who - List online users\n                                 /clear - Clear message history\n                                 /hug @name - Send a hug\n                                 /slap @name - Slap someone with a trout\n                                 /block @name - Block a user\n                                 /unblock @name - Unblock a user\n                                 /fav @name - Add user to favorites\n                                 /unfav @name - Remove user from favorites\n                                 /help - Show this help message";
                 self.add_system_message(help_text.to_string());
             }
             Command::Who => {
@@ -344,7 +334,7 @@ impl MyApp {
                 self.add_system_message(format!("Could not wipe identity file: {}", e));
             }
         }
-
+        
         self.add_system_message("All data has been wiped. Please restart the application.".to_string());
     }
 
