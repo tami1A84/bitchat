@@ -550,6 +550,8 @@ dependencies = [
  "ed25519-dalek",
  "eframe",
  "futures",
+ "geo",
+ "geohash",
  "rand",
  "serde",
  "serde_bytes",
@@ -1761,6 +1763,21 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
+]
+
+[[package]]
+name = "geo"
+version = "0.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c07df8f0626d9776adb4d3adc0eaf7d089ae28e7165a4fc26743f3a35cd89f3f"
+
+[[package]]
+name = "geohash"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31f4a2446181449e4b4ee0b49a348372b70ab7630397e6f64cece65ee91886b3"
+dependencies = [
+ "geo",
 ]
 
 [[package]]
